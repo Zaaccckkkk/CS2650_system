@@ -3,3 +3,4 @@ __pycache__/
 .venv/
 .vendor/
 outputs/
+.DS_Store
