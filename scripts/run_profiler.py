@@ -35,6 +35,7 @@ def main() -> None:
         model_name=args.model,
         device=args.device,
     )
+    # Warm up optimizer state before collecting the profiled iteration.
     _ = profiler.warmup_one_iteration(batch=bundle.batch, target=bundle.target)
     loss = profiler.profile_one_iteration(batch=bundle.batch, target=bundle.target)
     artifacts = profiler.write_artifacts()
