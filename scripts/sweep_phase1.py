@@ -76,6 +76,7 @@ def main() -> None:
             model_name=args.model,
             device=args.device,
         )
+        _ = profiler.warmup_one_iteration(batch=bundle.batch, target=bundle.target)
         _ = profiler.profile_one_iteration(batch=bundle.batch, target=bundle.target)
         artifacts = profiler.write_artifacts()
 

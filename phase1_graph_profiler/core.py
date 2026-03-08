@@ -3,8 +3,9 @@ from __future__ import annotations
 import csv
 import json
 import time
+import weakref
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -63,14 +64,17 @@ class OpTraceDispatchMode(TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # type: ignore[override]
         kwargs = kwargs or {}
         in_tensors = [x for x in pytree.tree_leaves((args, kwargs)) if isinstance(x, torch.Tensor)]
-        input_ids = [id(t) for t in in_tensors]
+        input_ids = [self.profiler._tensor_uid(t) for t in in_tensors]
+
+        self._maybe_sync_for_tensors(in_tensors)
 
         start_ns = time.perf_counter_ns()
         out = func(*args, **kwargs)
+        out_tensors = [x for x in pytree.tree_leaves(out) if isinstance(x, torch.Tensor)]
+        self._maybe_sync_for_tensors(out_tensors or in_tensors)
         end_ns = time.perf_counter_ns()
 
-        out_tensors = [x for x in pytree.tree_leaves(out) if isinstance(x, torch.Tensor)]
-        output_ids = [id(t) for t in out_tensors]
+        output_ids = [self.profiler._tensor_uid(t) for t in out_tensors]
         output_bytes = sum(t.numel() * t.element_size() for t in out_tensors)
 
         self.profiler._record_op(
@@ -85,6 +89,15 @@ class OpTraceDispatchMode(TorchDispatchMode):
             output_bytes=output_bytes,
         )
         return out
+
+    @staticmethod
+    def _maybe_sync_for_tensors(tensors: Sequence[torch.Tensor]) -> None:
+        if not torch.cuda.is_available():
+            return
+        for t in tensors:
+            if t.is_cuda:
+                torch.cuda.synchronize(device=t.device)
+                return
 
 
 class GraphProfiler:
@@ -117,6 +130,9 @@ class GraphProfiler:
         self._producer_by_tensor: Dict[TensorId, int] = {}
         self._consumer_nodes_by_tensor: Dict[TensorId, List[int]] = defaultdict(list)
 
+        self._tensor_uid_counter = 0
+        self._uid_by_objid: Dict[int, Tuple[weakref.ref[torch.Tensor], TensorId]] = {}
+
         self._param_ids: Set[TensorId] = set()
         self._grad_ids: Set[TensorId] = set()
         self._optim_state_ids: Set[TensorId] = set()
@@ -124,13 +140,32 @@ class GraphProfiler:
         self._capture_model_state_ids()
 
     def _capture_model_state_ids(self) -> None:
-        self._param_ids = {id(p) for p in self.model.parameters()}
-        self._grad_ids = {id(p.grad) for p in self.model.parameters() if p.grad is not None}
+        self._param_ids = {self._tensor_uid(p) for p in self.model.parameters()}
+        self._grad_ids = {self._tensor_uid(p.grad) for p in self.model.parameters() if p.grad is not None}
         self._optim_state_ids = set()
         for state in self.optimizer.state.values():
             for v in state.values():
                 if isinstance(v, torch.Tensor):
-                    self._optim_state_ids.add(id(v))
+                    self._optim_state_ids.add(self._tensor_uid(v))
+
+    def _tensor_uid(self, t: torch.Tensor) -> TensorId:
+        oid = id(t)
+        item = self._uid_by_objid.get(oid)
+        if item is not None:
+            ref, uid = item
+            if ref() is t:
+                return uid
+
+        uid = self._tensor_uid_counter
+        self._tensor_uid_counter += 1
+
+        def _cleanup(_ref: weakref.ref[torch.Tensor], object_id: int = oid) -> None:
+            entry = self._uid_by_objid.get(object_id)
+            if entry is not None and entry[0] is _ref:
+                self._uid_by_objid.pop(object_id, None)
+
+        self._uid_by_objid[oid] = (weakref.ref(t, _cleanup), uid)
+        return uid
 
     @contextmanager
     def phase(self, name: str):
@@ -141,15 +176,15 @@ class GraphProfiler:
         finally:
             self.current_phase = old
 
-    def _categorize_tensor(self, t: torch.Tensor) -> str:
-        tid = id(t)
+    def _categorize_tensor(self, t: torch.Tensor, phase: str) -> str:
+        tid = self._tensor_uid(t)
         if tid in self._param_ids:
             return "parameter"
         if tid in self._grad_ids:
             return "gradient"
         if tid in self._optim_state_ids:
             return "optimizer_state"
-        if t.requires_grad:
+        if phase == "forward" and t.is_floating_point():
             return "activation"
         return "other"
 
@@ -186,9 +221,9 @@ class GraphProfiler:
                 self.edges.add((producer, node_id, "tensor_flow"))
 
         for t in output_tensors:
-            tid = id(t)
+            tid = self._tensor_uid(t)
             bytes_ = t.numel() * t.element_size()
-            category = self._categorize_tensor(t)
+            category = self._categorize_tensor(t, phase=phase)
             record = self.tensor_records.get(tid)
             if record is None:
                 self.tensor_records[tid] = TensorRecord(
@@ -211,6 +246,9 @@ class GraphProfiler:
 
     def _finalize_tensor_use_ranges(self) -> None:
         self._capture_model_state_ids()
+        backward_nodes = [n.node_id for n in self.nodes if n.phase == "backward"]
+        backward_last_node = max(backward_nodes) if backward_nodes else -1
+
         for tid, rec in self.tensor_records.items():
             if tid in self._param_ids:
                 rec.category = "parameter"
@@ -224,14 +262,47 @@ class GraphProfiler:
                 rec.first_use_node_id = min(rec.first_use_node_id, min(consumers))
                 rec.last_use_node_id = max(rec.last_use_node_id, max(consumers))
 
+            # Conservatively keep forward activations alive through backward.
+            if (
+                rec.category == "activation"
+                and rec.created_phase == "forward"
+                and backward_last_node >= 0
+            ):
+                rec.last_use_node_id = max(rec.last_use_node_id, backward_last_node)
+
+    def _resident_memory_bytes(self) -> Dict[str, int]:
+        param_bytes = sum(p.numel() * p.element_size() for p in self.model.parameters())
+        grad_bytes = sum(
+            p.grad.numel() * p.grad.element_size()
+            for p in self.model.parameters()
+            if p.grad is not None
+        )
+        optim_bytes = 0
+        for state in self.optimizer.state.values():
+            for v in state.values():
+                if isinstance(v, torch.Tensor):
+                    optim_bytes += v.numel() * v.element_size()
+        return {
+            "parameter": int(param_bytes),
+            "gradient": int(grad_bytes),
+            "optimizer_state": int(optim_bytes),
+        }
+
     def _compute_memory_timeline(self) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         by_start: Dict[int, List[TensorRecord]] = defaultdict(list)
         by_end: Dict[int, List[TensorRecord]] = defaultdict(list)
         for rec in self.tensor_records.values():
+            if rec.category in {"parameter", "gradient", "optimizer_state"}:
+                # These are treated as resident memory to avoid double counting.
+                continue
             by_start[rec.producer_node_id].append(rec)
             by_end[rec.last_use_node_id].append(rec)
 
+        resident = self._resident_memory_bytes()
         live_by_category: Dict[str, int] = defaultdict(int)
+        live_by_category["parameter"] = resident["parameter"]
+        live_by_category["gradient"] = resident["gradient"]
+        live_by_category["optimizer_state"] = resident["optimizer_state"]
         timeline: List[Dict[str, Any]] = []
         peak_total = -1
         peak_breakdown: Dict[str, int] = {}
@@ -280,10 +351,17 @@ class GraphProfiler:
         self._producer_by_tensor.clear()
         self._consumer_nodes_by_tensor.clear()
 
+        return self._run_iteration(batch=batch, target=target, profile=True)
+
+    def warmup_one_iteration(self, batch: Any, target: torch.Tensor) -> torch.Tensor:
+        return self._run_iteration(batch=batch, target=target, profile=False)
+
+    def _run_iteration(self, batch: Any, target: torch.Tensor, profile: bool) -> torch.Tensor:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
 
-        with OpTraceDispatchMode(self):
+        dispatch_cm = OpTraceDispatchMode(self) if profile else nullcontext()
+        with dispatch_cm:
             with self.phase("forward"):
                 if isinstance(batch, dict):
                     output = self.model(**batch)
@@ -297,7 +375,8 @@ class GraphProfiler:
             with self.phase("optimizer"):
                 self.optimizer.step()
 
-        self._finalize_tensor_use_ranges()
+        if profile:
+            self._finalize_tensor_use_ranges()
         return loss.detach()
 
     def write_artifacts(self) -> ProfileArtifacts:
