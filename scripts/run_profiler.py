@@ -59,7 +59,7 @@ def run_single_profile(
     artifacts = profiler.write_artifacts()
 
     # Read summary.json to extract peak memory.
-    summary_path = Path(artifacts.summary_json)
+    summary_path = Path(artifacts.summary_path)
     with summary_path.open("r") as f:
         summary = json.load(f)
 
@@ -74,7 +74,7 @@ def run_single_profile(
         "peak_memory_bytes": peak_bytes,
         "peak_memory_mb": peak_mb,
         "summary_json": str(summary_path),
-        "peak_breakdown_json": str(artifacts.peak_breakdown_json),
+        "peak_breakdown_json": str(artifacts.peak_breakdown_path),
     }
 
     print(f"[done] model={model_name}, bs={batch_size}, loss={float(loss.item()):.6f}, peak={peak_mb:.2f} MB")
