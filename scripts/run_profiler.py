@@ -6,8 +6,8 @@ import csv
 import json
 from pathlib import Path
 
-import torch
 import matplotlib.pyplot as plt
+import torch
 
 from phase1_graph_profiler import GraphProfiler
 from phase1_graph_profiler.models import build_model_bundle
@@ -28,6 +28,10 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def bytes_to_mb(x: int | float) -> float:
+    return x / (1024 ** 2)
+
+
 def run_single_profile(
     model_name: str,
     batch_size: int,
@@ -37,7 +41,7 @@ def run_single_profile(
     """
     Run the existing profiler once for one batch size.
     Save outputs under: output_root/model_name/bs_{batch_size}
-    Return a small summary dict containing peak memory info.
+    Return a summary dict containing peak memory info and its breakdown.
     """
     out_dir = output_root / model_name / f"bs_{batch_size}"
 
@@ -58,26 +62,48 @@ def run_single_profile(
     loss = profiler.profile_one_iteration(batch=bundle.batch, target=bundle.target)
     artifacts = profiler.write_artifacts()
 
-    # Read summary.json to extract peak memory.
+    # Read summary.json to extract peak memory and breakdown.
     summary_path = Path(artifacts.summary_path)
     with summary_path.open("r") as f:
         summary = json.load(f)
 
-    peak_bytes = summary["peak_breakdown"]["total_live_bytes"]
-    peak_mb = peak_bytes / (1024 ** 2)
+    peak = summary["peak_breakdown"]
+
+    parameter_bytes = int(peak.get("parameter_bytes", 0))
+    gradient_bytes = int(peak.get("gradient_bytes", 0))
+    activation_bytes = int(peak.get("activation_bytes", 0))
+    optimizer_state_bytes = int(peak.get("optimizer_state_bytes", 0))
+    other_bytes = int(peak.get("other_bytes", 0))
+    peak_bytes = int(peak.get("total_live_bytes", 0))
 
     result = {
         "model_name": model_name,
         "device": device,
         "batch_size": batch_size,
         "loss": float(loss.item()),
+
+        "parameter_bytes": parameter_bytes,
+        "gradient_bytes": gradient_bytes,
+        "activation_bytes": activation_bytes,
+        "optimizer_state_bytes": optimizer_state_bytes,
+        "other_bytes": other_bytes,
         "peak_memory_bytes": peak_bytes,
-        "peak_memory_mb": peak_mb,
+
+        "parameter_mb": bytes_to_mb(parameter_bytes),
+        "gradient_mb": bytes_to_mb(gradient_bytes),
+        "activation_mb": bytes_to_mb(activation_bytes),
+        "optimizer_state_mb": bytes_to_mb(optimizer_state_bytes),
+        "other_mb": bytes_to_mb(other_bytes),
+        "peak_memory_mb": bytes_to_mb(peak_bytes),
+
         "summary_json": str(summary_path),
         "peak_breakdown_json": str(artifacts.peak_breakdown_path),
     }
 
-    print(f"[done] model={model_name}, bs={batch_size}, loss={float(loss.item()):.6f}, peak={peak_mb:.2f} MB")
+    print(
+        f"[done] model={model_name}, bs={batch_size}, "
+        f"loss={float(loss.item()):.6f}, peak={result['peak_memory_mb']:.2f} MB"
+    )
     return result
 
 
@@ -88,7 +114,17 @@ def write_sweep_csv(results: list[dict], path: Path) -> None:
         "device",
         "batch_size",
         "loss",
+        "parameter_bytes",
+        "gradient_bytes",
+        "activation_bytes",
+        "optimizer_state_bytes",
+        "other_bytes",
         "peak_memory_bytes",
+        "parameter_mb",
+        "gradient_mb",
+        "activation_mb",
+        "optimizer_state_mb",
+        "other_mb",
         "peak_memory_mb",
         "summary_json",
         "peak_breakdown_json",
@@ -101,12 +137,19 @@ def write_sweep_csv(results: list[dict], path: Path) -> None:
 
 def write_sweep_summary(results: list[dict], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    results = sorted(results, key=lambda x: x["batch_size"])
+
     payload = {
         "model_name": results[0]["model_name"] if results else None,
         "device": results[0]["device"] if results else None,
         "num_runs": len(results),
         "batch_sizes": [r["batch_size"] for r in results],
-        "peak_memory_bytes": [r["peak_memory_bytes"] for r in results],
+        "parameter_mb": [r["parameter_mb"] for r in results],
+        "gradient_mb": [r["gradient_mb"] for r in results],
+        "activation_mb": [r["activation_mb"] for r in results],
+        "optimizer_state_mb": [r["optimizer_state_mb"] for r in results],
+        "other_mb": [r["other_mb"] for r in results],
         "peak_memory_mb": [r["peak_memory_mb"] for r in results],
         "results": results,
     }
@@ -116,20 +159,57 @@ def write_sweep_summary(results: list[dict], path: Path) -> None:
 
 def plot_peak_memory_vs_batch_size(results: list[dict], path: Path) -> None:
     """
-    Generate:
+    Generate a stacked bar chart:
     Peak Memory Consumption vs Mini-Batch Size (w/o AC)
+
+    Each bar includes the peak-memory breakdown:
+    - parameter
+    - gradient
+    - activation
+    - optimizer_state
+    - other
     """
     path.parent.mkdir(parents=True, exist_ok=True)
 
     results = sorted(results, key=lambda x: x["batch_size"])
-    batch_sizes = [r["batch_size"] for r in results]
-    peak_mb = [r["peak_memory_mb"] for r in results]
+    labels = [str(r["batch_size"]) for r in results]
 
-    plt.figure(figsize=(8, 5))
-    plt.bar([str(bs) for bs in batch_sizes], peak_mb)
+    parameter_mb = [r["parameter_mb"] for r in results]
+    gradient_mb = [r["gradient_mb"] for r in results]
+    activation_mb = [r["activation_mb"] for r in results]
+    optimizer_state_mb = [r["optimizer_state_mb"] for r in results]
+    other_mb = [r["other_mb"] for r in results]
+
+    x = list(range(len(labels)))
+
+    plt.figure(figsize=(10, 6))
+
+    b1 = plt.bar(x, parameter_mb, label="parameter")
+    b2 = plt.bar(x, gradient_mb, bottom=parameter_mb, label="gradient")
+
+    bottom_3 = [parameter_mb[i] + gradient_mb[i] for i in range(len(x))]
+    b3 = plt.bar(x, activation_mb, bottom=bottom_3, label="activation")
+
+    bottom_4 = [bottom_3[i] + activation_mb[i] for i in range(len(x))]
+    b4 = plt.bar(x, optimizer_state_mb, bottom=bottom_4, label="optimizer_state")
+
+    bottom_5 = [bottom_4[i] + optimizer_state_mb[i] for i in range(len(x))]
+    b5 = plt.bar(x, other_mb, bottom=bottom_5, label="other")
+
+    totals = [
+        parameter_mb[i] + gradient_mb[i] + activation_mb[i] + optimizer_state_mb[i] + other_mb[i]
+        for i in range(len(x))
+    ]
+
+    # Put total peak memory labels above each stacked bar.
+    for i, total in enumerate(totals):
+        plt.text(i, total, f"{total:.1f}", ha="center", va="bottom", fontsize=9)
+
+    plt.xticks(x, labels)
     plt.title("Peak Memory Consumption vs Mini-Batch Size (w/o AC)")
     plt.xlabel("Mini-Batch Size")
     plt.ylabel("Peak Memory Consumption (MB)")
+    plt.legend()
     plt.tight_layout()
     plt.savefig(path)
     plt.close()
@@ -146,7 +226,7 @@ def run_batch_size_sweep(
     - one normal profiler output directory per batch size
     - one aggregate CSV
     - one aggregate summary JSON
-    - one final bar graph
+    - one final stacked bar graph
     """
     results = []
 
@@ -174,12 +254,11 @@ def main() -> None:
     args = parse_args()
     output_root = Path(args.output_dir)
 
-    # Validate arguments:
-    # exactly one of --batch-size or --batch-sizes should be provided.
+    # Exactly one of --batch-size or --batch-sizes should be provided.
     if (args.batch_size is None) == (args.batch_sizes is None):
         raise ValueError("Please provide exactly one of --batch-size or --batch-sizes.")
 
-    # Single-run mode: preserve existing behavior.
+    # Single-run mode.
     if args.batch_size is not None:
         result = run_single_profile(
             model_name=args.model,
@@ -190,7 +269,7 @@ def main() -> None:
         print(json.dumps(result, indent=2))
         return
 
-    # Sweep mode: new Phase 1(b) flow.
+    # Sweep mode.
     run_batch_size_sweep(
         model_name=args.model,
         batch_sizes=args.batch_sizes,
